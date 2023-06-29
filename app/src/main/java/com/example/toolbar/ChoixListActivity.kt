@@ -1,8 +1,11 @@
 package com.example.toolbar
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import androidx.appcompat.app.AppCompatActivity
 import android.os.Bundle
 import android.view.LayoutInflater
@@ -14,17 +17,23 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
-import com.android.volley.Request
+import androidx.room.Room
+
 import com.android.volley.Response
 import com.android.volley.toolbox.JsonObjectRequest
 import com.android.volley.toolbox.Volley
 import com.google.gson.Gson
+import kotlinx.coroutines.Dispatchers
 import org.json.JSONException
 import org.json.JSONObject
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
 
 class ChoixListActivity : AppCompatActivity() {
-    // Variables pour stocker les données
 
+    private lateinit var db: AppDatabase
 
     private lateinit var username: String
     private lateinit var listData: ListData
@@ -41,9 +50,9 @@ class ChoixListActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_choix_list)
-
         setSupportActionBar(findViewById(R.id.toolbar))
 
+        db = AppDatabase.getDatabase(applicationContext)
         // Initialisation des SharedPreferences et Gson
         sharedPreferences = getSharedPreferences("ListData", Context.MODE_PRIVATE)
         gson = Gson()
@@ -52,8 +61,9 @@ class ChoixListActivity : AppCompatActivity() {
         username = intent.getStringExtra("username").toString()
         val urlAPI = loadUrl()
 
+        listData=ListData(mutableListOf())
         retrieveUserLists(urlAPI)
-        listData = loadData()
+
 
         // Configuration du RecyclerView
         recyclerView = findViewById(R.id.recyclerView)
@@ -75,31 +85,6 @@ class ChoixListActivity : AppCompatActivity() {
 
     }
 
-    // Méthode pour ajouter une nouvelle liste
-    private fun addNewList(listName: String , id: String) {
-        val newList = ListData.ItemList(id, listName)
-        listData.itemLists.add(newList)
-        saveData(listData)
-        recyclerView.adapter?.notifyDataSetChanged()
-    }
-
-    // Méthode pour sauvegarder les données dans les SharedPreferences
-    private fun saveData(data: ListData) {
-        val jsonData = gson.toJson(data)
-        val editor = sharedPreferences.edit()
-        editor.putString(username, jsonData)
-        editor.apply()
-    }
-
-    // Méthode pour charger les données depuis les SharedPreferences
-    private fun loadData(): ListData {
-        val jsonData = sharedPreferences.getString(username, null)
-        return if (jsonData != null) {
-            gson.fromJson(jsonData, ListData::class.java)
-        } else {
-            ListData(mutableListOf())
-        }
-    }
 
     // Adaptateur pour le RecyclerView
     inner class ItemListAdapter(private val itemLists: MutableList<ListData.ItemList>) :
@@ -144,29 +129,52 @@ class ChoixListActivity : AppCompatActivity() {
         }
     }
 
-    private fun retrieveUserLists(urlAPI: String) {
-        val url = urlAPI+"lists"
-
-        val requestQueue = Volley.newRequestQueue(this)
-        val request = object : JsonObjectRequest(
-            Request.Method.GET, url, null,
-            Response.Listener { response ->
-                System.out.println(response.toString())
-                handleUserListsResponse(response)
-            },
-            Response.ErrorListener { error ->
-                Toast.makeText(this, "API connection error: ${error.message}", Toast.LENGTH_LONG).show()
-                System.out.println(error.message)
-            }) {
-            override fun getHeaders(): MutableMap<String, String> {
-                val headers = HashMap<String, String>()
-                val token = getToken() // Get the identification token from preferences
-                headers["hash"] = token
-                return headers
+    private fun isNetworkAvailable(): Boolean {
+        val connectivityManager = getSystemService(ConnectivityManager::class.java)
+        if (connectivityManager != null) {
+            val capabilities =
+                connectivityManager.getNetworkCapabilities(connectivityManager.activeNetwork)
+            if (capabilities != null) {
+                if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                    return true
+                } else if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    return true
+                } else if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
+                    return true
+                }
             }
         }
+        return false
+    }
 
-        requestQueue.add(request)
+    private fun retrieveUserLists(urlAPI: String) {
+
+        if (isNetworkAvailable()) {
+            // L'utilisateur dispose d'une connexion Internet, exécuter la requête Volley
+            val url = urlAPI+"lists"
+
+            val requestQueue = Volley.newRequestQueue(this)
+            val request = object : JsonObjectRequest(
+                Method.GET, url, null,
+                Response.Listener { response ->
+                    handleUserListsResponse(response)
+                },
+                Response.ErrorListener { error ->
+                }) {
+                override fun getHeaders(): MutableMap<String, String> {
+                    val headers = HashMap<String, String>()
+                    val token = getToken() // Get the identification token from preferences
+                    headers["hash"] = token
+                    return headers
+                }
+            }
+
+            requestQueue.add(request)
+        } else {
+            // L'utilisateur n'a pas de connexion Internet, charger les listes à partir de la base de données locale
+            loadUserListsFromDatabase()
+        }
+
     }
 
     private fun getToken(): String {
@@ -175,6 +183,7 @@ class ChoixListActivity : AppCompatActivity() {
     }
 
     // Méthode pour traiter la réponse contenant les listes de l'utilisateur
+    @SuppressLint("NotifyDataSetChanged")
     private fun handleUserListsResponse(response: JSONObject) {
         try {
             // Clear existing item lists
@@ -188,10 +197,14 @@ class ChoixListActivity : AppCompatActivity() {
                 val label = listObject.getString("label")
                 val itemList = ListData.ItemList(id, label)
                 listData.itemLists.add(itemList)
+
+                val listEntity = ListEntity(id, label, username)
+                GlobalScope.launch {
+                    db.listDao().insertList(listEntity)
+                }
             }
 
             // Save the updated data and update the RecyclerView adapter
-            saveData(listData)
             recyclerView.adapter?.notifyDataSetChanged()
         } catch (e: JSONException) {
             e.printStackTrace()
@@ -208,13 +221,11 @@ class ChoixListActivity : AppCompatActivity() {
 
         val requestQueue = Volley.newRequestQueue(this)
         val request = object : JsonObjectRequest(
-            Request.Method.POST, url, null,
+            Method.POST, url, null,
             Response.Listener { response ->
                 addListResponse(response)
             },
             Response.ErrorListener { error ->
-                Toast.makeText(this, "API connection error: ${error.message}", Toast.LENGTH_LONG).show()
-                System.out.println(error.message)
             }) {
             override fun getHeaders(): MutableMap<String, String> {
                 val headers = HashMap<String, String>()
@@ -226,6 +237,7 @@ class ChoixListActivity : AppCompatActivity() {
 
         requestQueue.add(request)
     }
+    @SuppressLint("NotifyDataSetChanged")
     private fun addListResponse(response: JSONObject) {
         try {
             val data = response.getJSONObject("list")
@@ -234,7 +246,6 @@ class ChoixListActivity : AppCompatActivity() {
             val itemList = ListData.ItemList(id, label)
             listData.itemLists.add(itemList)
 
-            saveData(listData)
             recyclerView.adapter?.notifyDataSetChanged()
 
         } catch (e: JSONException) {
@@ -242,9 +253,24 @@ class ChoixListActivity : AppCompatActivity() {
         }
     }
 
+    private fun loadUserListsFromDatabase() {
+        GlobalScope.launch(Dispatchers.Main) {
+            val lists = withContext(Dispatchers.IO) {
+                db.listDao().getAllListsByUser(username)
+            }
+            listData.itemLists.clear()
+            listData.itemLists.addAll(lists.map { ListData.ItemList(it.id, it.label) })
+            recyclerView.adapter?.notifyDataSetChanged()
+        }
+    }
+
+
 }
 
 // Modèle de données pour les listes
 data class ListData(var itemLists: MutableList<ItemList>) {
     data class ItemList(val id: String, val name: String)
 }
+
+
+
